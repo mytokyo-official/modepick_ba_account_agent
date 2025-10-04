@@ -1,0 +1,15 @@
+[project]
+name = "modepick-ba-account-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "google-adk>=1.15.1",
+    "langsmith>=0.4.32",
+    "litellm>=1.77.5",
+    "python-dotenv>=1.1.1",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "greenlet>=3.0.0",
+]
