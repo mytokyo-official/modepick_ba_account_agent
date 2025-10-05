@@ -7,7 +7,7 @@ import os
 from typing import List, Tuple, Optional
 
 
-from sqlalchemy import Column, Integer, String, DateTime, select, Text, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, select, Text, Boolean, Float
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -17,6 +17,7 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 import datetime
 
+from agents.account_classifier import account_classifier, AccountClassificationOutput
 from agents.message_divider_agent import card_message_divider_agent, DividedMessageOutput, bank_message_divider_agent
 from langsmith.integrations.otel import configure
 
@@ -41,6 +42,13 @@ class 장부_결제문자(Base):
     currency = Column(Text)
     거래상대 = Column(Text)
     발신자명 = Column(Text)
+    거래목적 = Column(Text)
+    계정과목_대 = Column(Text)
+    계정과목_소 = Column(Text)
+
+    account_reason = Column(Text)
+    confidence = Column(Float)
+
 
 async def get_database_session() -> AsyncSession:
     """DSN을 사용하여 PostgreSQL 데이터베이스에 연결"""
@@ -209,6 +217,111 @@ async def remove_duplicate_message():
         await db_session.close()
 
 
+async def count_unique_transaction_parties():
+    """거래목적이 없는 승인 레코드들 처리하기"""
+    db_session = await get_database_session()
+    try:
+        # 먼저 transaction_type이 N이 아니고 None도 아닌 모든 레코드 조회 (컨텍스트 용도)
+        all_records_stmt = select(장부_결제문자).filter(
+            장부_결제문자.transaction_type != 'N',
+            장부_결제문자.transaction_type.is_not(None)
+        )
+        all_records_result = await db_session.execute(all_records_stmt)
+        all_records = all_records_result.scalars().all()
+        
+        # 처리할 대상 레코드들 조회 (거래목적이 없는 승인 레코드)
+        target_stmt = select(장부_결제문자).filter(
+            장부_결제문자.transaction_type.in_(['승인']),
+            장부_결제문자.거래상대.is_not(None),
+            장부_결제문자.거래목적.is_(None)
+        ).order_by(장부_결제문자.결제시간.asc())
+        
+        target_result = await db_session.execute(target_stmt)
+        target_rows = target_result.scalars().all()
+
+        import re
+        from difflib import SequenceMatcher
+
+        APP_NAME = "account_app"
+        USER_ID = "modepick"
+        session_count = 0
+
+        def similarity(a, b):
+            """두 문자열의 유사도 계산"""
+            return SequenceMatcher(None, a, b).ratio()
+
+        for row in target_rows:
+            # 현재 row의 거래상대와 비슷한 거래상대들을 모든 레코드에서 찾기
+            similar_records = []
+            current_party = row.거래상대
+
+            for record in all_records:
+                if record.거래상대 and similarity(current_party, record.거래상대) > 0.8:  # 80% 이상 유사
+                    # 거래목적, 계정과목 정보가 있는 경우만 추가
+                    if (record.거래목적 or record.계정과목_대 or record.계정과목_소 or record.account_reason):
+                        similar_records.append(record)
+            
+            # agent에 넘길 컨텍스트 정보 구성
+            context_info = []
+            for similar in similar_records:
+                context_info.append({
+                    "거래상대": similar.거래상대,
+                    "거래목적": similar.거래목적,
+                    "계정과목_대": similar.계정과목_대,
+                    "계정과목_소": similar.계정과목_소,
+                    "account_reason": similar.account_reason
+                })
+            
+            SESSION_ID = f"session_{session_count}"
+            adk_session_service = InMemorySessionService()
+            adk_session = await adk_session_service.create_session(app_name=APP_NAME, user_id=USER_ID,
+                                                                   session_id=SESSION_ID)
+
+            runner = Runner(
+                agent=account_classifier,
+                app_name=APP_NAME,
+                session_service=adk_session_service
+            )
+            
+            # 컨텍스트 정보와 함께 메시지 구성
+            party_str = f"거래상대: {row.거래상대}, 금액: {row.amount}{row.currency}"
+            if context_info:
+                party_str += f"\n\n유사한 거래 이력:\n"
+                for i, ctx in enumerate(context_info[:30]):  # 최대 3개까지만
+                    party_str += f"{i+1}. 거래상대: {ctx['거래상대']}, 거래목적: {ctx['거래목적']}, 계정과목(대): {ctx['계정과목_대']}, 계정과목(소): {ctx['계정과목_소']}, 사유: {ctx['account_reason']}\n"
+            
+            content = types.Content(role='user', parts=[types.Part(text=party_str)])
+            final_response_text = None
+            async for event in runner.run_async(user_id=USER_ID, session_id=SESSION_ID,
+                                                new_message=content):
+                if event.is_final_response():
+                    if event.content and event.content.parts:
+                        final_response_text = event.content.parts[0].text
+                    elif event.actions and event.actions.escalate:
+                        final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
+
+            if final_response_text:
+                account_classification_output = AccountClassificationOutput.model_validate_json(final_response_text)
+                print(f"처리 중: {party_str}  날짜: {row.결제시간} ({len(similar_records)}개 유사 레코드)")
+                print(account_classification_output)
+                print("-"*50)
+                
+                row.거래목적 = account_classification_output.business_purpose
+                row.계정과목_대 = account_classification_output.main_category
+                row.계정과목_소 = account_classification_output.sub_category
+                row.account_reason = account_classification_output.reason
+                row.confidence = account_classification_output.confidence
+                await db_session.commit()
+
+            if session_count > 30:
+                break
+
+            session_count += 1
+            
+    finally:
+        await db_session.close()
+
+
 async def preprocess_message(_message):
     new_message = _message
     new_message = new_message.replace("[Web발신] The Platinum ", "")
@@ -225,7 +338,7 @@ async def preprocess_message(_message):
 
     return new_message
 
-async def run():
+async def message_divider_run():
     # results = await get_null_transaction_messages()
     # for mac_message_id, message, 결제시간, 발신번호 in results:
     #     print(f"{mac_message_id}: {message} {결제시간} {발신번호}")
@@ -328,5 +441,6 @@ async def run():
 if __name__ == "__main__":
 
     # asyncio.run(update_all_records())
-    asyncio.run(remove_duplicate_message())
-    asyncio.run(run())
+    asyncio.run(count_unique_transaction_parties())
+    # asyncio.run(remove_duplicate_message())
+    # asyncio.run(message_divider_run())
