@@ -8,11 +8,11 @@ from langsmith.integrations.otel import configure
 
 from config import SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_ERROR_LOG_CHANNEL_ID
 from services import (
-    update_all_records, 
-    remove_duplicate_message, 
-    message_divider_run, 
-    infer_account, 
-    check_last_message_upload
+    update_all_records,
+    remove_duplicate_message,
+    message_divider_run,
+    infer_account,
+    check_last_message_upload, update_cancel_transactions
 )
 from handlers import handle_message
 
@@ -32,6 +32,7 @@ async def run_agent_routine():
     await update_all_records()
     await remove_duplicate_message()
     await message_divider_run()
+    await update_cancel_transactions()
     await infer_account(app)
 
 async def check_last_message_upload_wrapper():

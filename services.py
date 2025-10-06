@@ -11,7 +11,8 @@ from google.genai import types
 
 from database import get_database_session
 from models import 장부_결제문자
-from config import CARD_SENDER_LIST, BANK_SENDER_LIST, APP_NAME, USER_ID
+from config import CARD_SENDER_LIST, BANK_SENDER_LIST, APP_NAME, USER_ID, SLACK_ERROR_LOG_CHANNEL_ID, \
+    SLACK_ACCOUNT_CHANNEL_ID
 from agents.account_classifier import account_classifier, AccountClassificationOutput
 from agents.message_divider_agent import card_message_divider_agent, DividedMessageOutput, bank_message_divider_agent
 
@@ -385,3 +386,52 @@ async def check_last_message_upload(_app):
             channel=SLACK_ERROR_LOG_CHANNEL_ID,
             text=traceback.format_exc()
         )
+
+async def update_cancel_transactions():
+    """승인취소 거래와 매칭되는 승인 거래들의 거래목적을 '취소건'으로 업데이트"""
+    db_session = await get_database_session()
+    try:
+        # 승인취소 거래들 조회
+        refund_stmt = select(장부_결제문자).filter(
+            장부_결제문자.transaction_type == '승인취소',
+            장부_결제문자.거래목적.is_(None)
+        )
+        refund_result = await db_session.execute(refund_stmt)
+        refund_rows = refund_result.scalars().all()
+        
+        # 승인 거래들 조회
+        approval_stmt = select(장부_결제문자).filter(
+            장부_결제문자.transaction_type == '승인'
+        )
+        approval_result = await db_session.execute(approval_stmt)
+        approval_rows = approval_result.scalars().all()
+        
+        updated_count = 0
+        
+        for refund_row in refund_rows:
+            # amount와 currency가 동일한 승인 거래들 찾기
+            matching_approvals = [
+                approval for approval in approval_rows
+                if approval.amount == refund_row.amount and approval.currency == refund_row.currency
+            ]
+
+            if not matching_approvals:
+                print("찾을수 없음.", refund_row.message)
+            
+            # 거래상대 유사도가 0.8 이상인 것 찾기
+            for approval in matching_approvals:
+                if approval.거래상대 and refund_row.거래상대:
+                    similarity_score = similarity(refund_row.거래상대, approval.거래상대)
+                    if similarity_score >= 80:
+                        # 매칭되는 승인 거래와 승인취소 거래 모두 거래목적을 '취소건'으로 설정
+                        approval.거래목적 = "취소건"
+                        refund_row.거래목적 = "취소건"
+                        updated_count += 2
+                        
+                        # print(f"취소건 매칭: 승인({approval.mac_message_id}) <-> 승인취소({refund_row.mac_message_id}) (유사도: {similarity_score:.1f}%)")
+        
+        await db_session.commit()
+        print(f"총 {updated_count}개의 거래가 '취소건'으로 업데이트되었습니다.")
+        
+    finally:
+        await db_session.close()
