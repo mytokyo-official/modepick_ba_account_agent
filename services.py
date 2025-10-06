@@ -1,0 +1,387 @@
+import datetime
+import asyncio
+import re
+import traceback
+from typing import List, Tuple, Optional
+from sqlalchemy import select
+from rapidfuzz import fuzz
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
+from database import get_database_session
+from models import 장부_결제문자
+from config import CARD_SENDER_LIST, BANK_SENDER_LIST, APP_NAME, USER_ID
+from agents.account_classifier import account_classifier, AccountClassificationOutput
+from agents.message_divider_agent import card_message_divider_agent, DividedMessageOutput, bank_message_divider_agent
+
+async def update_all_records():
+    """모든 장부_결제문자 레코드를 업데이트하여 장부에포함을 True로 설정하고 카드사명을 추가"""
+    db_session = await get_database_session()
+    try:
+        # 모든 레코드 조회
+        stmt = select(장부_결제문자)
+        result = await db_session.execute(stmt)
+        rows = result.scalars().all()
+        
+        for row in rows:
+            # 장부에포함을 True로 설정
+            row.장부에포함 = True
+            
+            # 발신번호를 기반으로 카드사명 설정
+            if row.발신번호 in CARD_SENDER_LIST:
+                row.발신자명 = CARD_SENDER_LIST[row.발신번호]
+
+            elif row.발신번호 in BANK_SENDER_LIST:
+                row.발신자명 = BANK_SENDER_LIST[row.발신번호]
+            else:
+                print(f"없는 번호: {row.발신번호}")
+
+        # 모든 변경사항 커밋
+        await db_session.commit()
+        
+    finally:
+        await db_session.close()
+
+async def remove_duplicate_message():
+    """SJ_로 시작하고 발신번호가 현대카드이며 '고*지'가 포함된 메시지들의 transaction_type을 N으로 업데이트"""
+    db_session = await get_database_session()
+    try:
+        # SJ_로 시작하고, 발신번호가 '+8215776200'이며, '고*지'가 포함된 레코드 조회
+        stmt = select(장부_결제문자).filter(
+            장부_결제문자.mac_message_id.like('SJ_%'),
+            장부_결제문자.발신번호 == '+8215776200',
+            장부_결제문자.message.like('%고*지%')
+        )
+        
+        result = await db_session.execute(stmt)
+        rows = result.scalars().all()
+        
+        # transaction_type을 'N'으로 업데이트
+        updated_count = 0
+        for row in rows:
+            row.transaction_type = 'N'
+            updated_count += 1
+        
+        # 모든 변경사항 커밋
+        await db_session.commit()
+    finally:
+        await db_session.close()
+
+async def preprocess_message(_message):
+    new_message = _message
+    new_message = new_message.replace("[Web발신] The Platinum ", "")
+    new_message = new_message.replace("[Web발신] 올리브영 현대카드 ", "")
+    new_message = new_message.replace("[Web발신] 대한항공카드 ", "")
+    new_message = new_message.replace("[Web발신] KB국민카드", "")
+    new_message = new_message.replace("[Web발신] [현대카드] ", "")
+    new_message = new_message.replace("고*지", "")
+    new_message = new_message.replace("권*진", "")
+    new_message = new_message.replace("[Web발신]", "")
+    new_message = new_message.replace(".00", "")
+    new_message = new_message.split("누적")[0]
+    new_message = new_message.split("잔액")[0]
+
+    return new_message
+
+def similarity(a, b):
+    """두 문자열의 유사도 계산"""
+    return fuzz.ratio(a, b)
+
+async def infer_account(_app):
+    """거래목적이 없는 승인 레코드들 처리하기"""
+    db_session = await get_database_session()
+    try:
+        # 먼저 transaction_type이 N이 아니고 None도 아니며 confidence가 0.95 이상인 레코드 조회 (컨텍스트 용도)
+        all_records_stmt = select(장부_결제문자).filter(
+            장부_결제문자.transaction_type != 'N',
+            장부_결제문자.transaction_type.is_not(None),
+            장부_결제문자.confidence >= 0.90
+        )
+        all_records_result = await db_session.execute(all_records_stmt)
+        all_records = all_records_result.scalars().all()
+        
+        # 처리할 대상 레코드들 조회 (거래목적이 없는 승인 레코드)
+        target_stmt = select(장부_결제문자).filter(
+            장부_결제문자.transaction_type.in_(['승인']),
+            장부_결제문자.거래상대.is_not(None),
+            장부_결제문자.거래목적.is_(None)
+        ).order_by(장부_결제문자.결제시간.asc())
+        
+        target_result = await db_session.execute(target_stmt)
+        target_rows = target_result.scalars().all()
+
+        session_count = 0
+
+        async def process_single_row(row, session_id_suffix):
+            """단일 row 처리 함수"""
+            # 각 작업마다 독립적인 데이터베이스 세션 생성
+            local_db_session = await get_database_session()
+            
+            try:
+                # 현재 처리할 row를 새 세션에서 다시 조회
+                local_row_stmt = select(장부_결제문자).filter(
+                    장부_결제문자.mac_message_id == row.mac_message_id
+                )
+                local_row_result = await local_db_session.execute(local_row_stmt)
+                local_row = local_row_result.scalars().first()
+                
+                if not local_row:
+                    return None
+                
+                # 현재 row의 거래상대와 비슷한 거래상대들을 모든 레코드에서 찾기
+                similar_records = []
+                current_party = local_row.거래상대
+
+                for record in all_records:
+                    similarity_score = similarity(current_party, record.거래상대)
+                    if record.거래상대 and similarity_score > 70:  # 80% 이상 유사
+                        # 거래목적, 계정과목 정보가 있는 경우만 추가
+                        if (record.거래목적 or record.계정과목_대 or record.계정과목_소 or record.account_reason):
+                            similar_records.append(record)
+                
+                # agent에 넘길 컨텍스트 정보 구성 (거래목적, 계정과목_대, 계정과목_소가 유니크하며 confidence가 가장 높은 것만)
+                combination_best = {}
+                
+                for similar in similar_records:
+                    # 거래목적, 계정과목_대, 계정과목_소 조합을 키로 사용
+                    combination_key = (similar.거래목적, similar.계정과목_대, similar.계정과목_소)
+                    
+                    # 해당 조합이 처음이거나, 더 높은 confidence를 가진 경우 업데이트
+                    if (combination_key not in combination_best or 
+                        (similar.confidence and similar.confidence > (combination_best[combination_key]["confidence"] or 0))):
+                        combination_best[combination_key] = {
+                            "거래상대": similar.거래상대,
+                            "거래목적": similar.거래목적,
+                            "계정과목_대": similar.계정과목_대,
+                            "계정과목_소": similar.계정과목_소,
+                            "account_reason": similar.account_reason,
+                            "confidence": similar.confidence
+                        }
+                
+                # confidence 순으로 정렬하여 context_info 구성
+                context_info = sorted(combination_best.values(), 
+                                    key=lambda x: x["confidence"] or 0, reverse=True)
+                
+                SESSION_ID = f"session_{session_id_suffix}"
+                adk_session_service = InMemorySessionService()
+                adk_session = await adk_session_service.create_session(app_name=APP_NAME, user_id=USER_ID,
+                                                                       session_id=SESSION_ID)
+
+                runner = Runner(
+                    agent=account_classifier,
+                    app_name=APP_NAME,
+                    session_service=adk_session_service
+                )
+                
+                # 컨텍스트 정보와 함께 메시지 구성
+                party_str = f"거래상대: {local_row.거래상대}, 금액: {local_row.amount}{local_row.currency}"
+                if context_info:
+                    party_str += f"\n\n유사한 거래 이력:\n"
+                    for i, ctx in enumerate(context_info[:30]):  # 최대 30개까지만
+                        party_str += f"{i+1}. 거래상대: {ctx['거래상대']}, 거래목적: {ctx['거래목적']}, 계정과목(대): {ctx['계정과목_대']}, 계정과목(소): {ctx['계정과목_소']}, 사유: {ctx['account_reason']}\n"
+                
+                content = types.Content(role='user', parts=[types.Part(text=party_str)])
+                final_response_text = None
+                async for event in runner.run_async(user_id=USER_ID, session_id=SESSION_ID,
+                                                    new_message=content):
+                    if event.is_final_response():
+                        if event.content and event.content.parts:
+                            final_response_text = event.content.parts[0].text
+                        elif event.actions and event.actions.escalate:
+                            final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
+
+                if final_response_text:
+                    account_classification_output = AccountClassificationOutput.model_validate_json(final_response_text)
+                    
+                    # Slack으로 결과 전송 (데스크톱 최적화 - 컴팩트)
+                    date_str = local_row.결제시간.strftime("%m/%d %H:%M") if local_row.결제시간 else "미확인"
+                    slack_message = f"""{date_str} | {local_row.발신자명} | {local_row.거래상대} | {local_row.amount:,}{local_row.currency} → `{account_classification_output.business_purpose}` > `{account_classification_output.main_category}` > `{account_classification_output.sub_category}` | 아이디: {local_row.mac_message_id}"""
+
+                    try:
+                        await _app.client.chat_postMessage(
+                            channel=SLACK_ACCOUNT_CHANNEL_ID,
+                            text=slack_message
+                        )
+                    except Exception as e:
+                        print(f"Slack 메시지 전송 실패: {e}")
+                    
+                    local_row.거래목적 = account_classification_output.business_purpose
+                    local_row.계정과목_대 = account_classification_output.main_category
+                    local_row.계정과목_소 = account_classification_output.sub_category
+                    local_row.account_reason = account_classification_output.reason
+                    local_row.confidence = account_classification_output.confidence
+                    await local_db_session.commit()
+                
+                return local_row
+                
+            except Exception as e:
+                print(f"에러 발생: {e}")
+                await local_db_session.rollback()
+                return None
+            finally:
+                await local_db_session.close()
+
+        # 10개 단위로 배치 처리
+        batch_size = 5
+        total_processed = 0
+        
+        for i in range(0, len(target_rows), batch_size):
+            batch = target_rows[i:i + batch_size]
+            print(f"\n배치 {i//batch_size + 1} 처리 중... ({len(batch)}개 레코드)")
+            
+            # 배치 내 작업들을 병렬로 실행
+            tasks = []
+            for j, row in enumerate(batch):
+                session_id = f"{total_processed + j}"
+                tasks.append(process_single_row(row, session_id))
+            
+            # 배치 단위로 병렬 실행
+            await asyncio.gather(*tasks)
+            
+            total_processed += len(batch)
+            print(f"배치 완료. 총 {total_processed}개 처리됨")
+
+            
+    finally:
+        await db_session.close()
+
+async def message_divider_run():
+    db_session = await get_database_session()
+    try:
+        # 2025-09-01 00:00:00 (KST 기준으로 저장된 시간)
+        filter_date = datetime.datetime(2025, 9, 1, 0, 0, 0)
+
+        stmt = select(장부_결제문자).filter(
+            장부_결제문자.transaction_type.is_(None),
+            장부_결제문자.결제시간 >= filter_date
+        )
+
+        result = await db_session.execute(stmt)
+        rows = result.scalars().all()
+
+        session_count = 0
+
+        for row in rows:
+            SESSION_ID = f"session_{session_count}"
+            adk_session_service = InMemorySessionService()
+            adk_session = await adk_session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID)
+
+            if row.발신번호 in CARD_SENDER_LIST:
+                runner = Runner(
+                    agent=card_message_divider_agent,
+                    app_name=APP_NAME,
+                    session_service=adk_session_service
+                )
+            elif row.발신번호 in BANK_SENDER_LIST:
+                runner = Runner(
+                    agent=bank_message_divider_agent,
+                    app_name=APP_NAME,
+                    session_service=adk_session_service
+                )
+            else:
+                print(row.message, row.발신번호, "runner 생성 실패.")
+                continue
+
+            preprocessed_message = await preprocess_message(row.message)
+
+            content = types.Content(role='user', parts=[types.Part(text=preprocessed_message)])
+            final_response_text = None
+            async for event in runner.run_async(user_id=USER_ID, session_id=SESSION_ID,
+                                                new_message=content):
+                if event.is_final_response():
+                    if event.content and event.content.parts:
+                        final_response_text = event.content.parts[0].text
+                    elif event.actions and event.actions.escalate:  # Handle potential errors/escalations
+                        final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
+
+            if final_response_text:
+                divided_message = DividedMessageOutput.model_validate_json(final_response_text)
+                print(preprocessed_message)
+                print(divided_message)
+                print("-" * 50)
+                row.transaction_type = divided_message.transaction_type
+                row.amount = divided_message.amount
+                row.currency = divided_message.currency
+                row.거래상대 = divided_message.transaction_party
+                await db_session.commit()
+
+            session_count += 1
+
+    finally:
+        await db_session.close()
+
+async def check_last_message_upload(_app):
+    async def check_async():
+        db_session = await get_database_session()
+        try:
+            # SJ로 시작하는 가장 최신 메시지 조회
+            sj_stmt = select(장부_결제문자.결제시간).filter(
+                장부_결제문자.mac_message_id.like('SJ_%')
+            ).order_by(장부_결제문자.결제시간.desc()).limit(1)
+            
+            sj_result = await db_session.execute(sj_stmt)
+            sj_latest = sj_result.scalar()
+            
+            # HJ로 시작하는 가장 최신 메시지 조회
+            hj_stmt = select(장부_결제문자.결제시간).filter(
+                장부_결제문자.mac_message_id.like('HJ_%')
+            ).order_by(장부_결제문자.결제시간.desc()).limit(1)
+            
+            hj_result = await db_session.execute(hj_stmt)
+            hj_latest = hj_result.scalar()
+
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            
+            # SJ 체크 (48시간 이상 차이)
+            if sj_latest:
+                # timezone naive인 경우 UTC로 간주
+                if sj_latest.tzinfo is None:
+                    sj_latest = sj_latest.replace(tzinfo=datetime.timezone.utc)
+                
+                time_diff = current_time - sj_latest
+                print(f"SJ 최신 메시지 시간: {sj_latest}, 현재 시간: {current_time}, 차이: {time_diff}")
+                
+                if time_diff >= datetime.timedelta(hours=48):
+                    try:
+                        await _app.client.chat_postMessage(
+                            channel=SLACK_ACCOUNT_CHANNEL_ID,
+                            text="<@U061Q5EC7FS> 마지막 메세지 업로드가 48시간 지났습니다. 업로드 부탁드려요~"
+                        )
+                        print("SJ 48시간 경고 메시지 전송 완료")
+                    except Exception as e:
+                        raise e
+                else:
+                    print(f"SJ는 아직 48시간이 지나지 않음 (남은 시간: {datetime.timedelta(hours=48) - time_diff})")
+            
+            # HJ 체크 (48시간 이상 차이)
+            if hj_latest:
+                # timezone naive인 경우 UTC로 간주
+                if hj_latest.tzinfo is None:
+                    hj_latest = hj_latest.replace(tzinfo=datetime.timezone.utc)
+                
+                time_diff = current_time - hj_latest
+                print(f"HJ 최신 메시지 시간: {hj_latest}, 현재 시간: {current_time}, 차이: {time_diff}")
+                
+                if time_diff >= datetime.timedelta(hours=48):
+                    try:
+                        await _app.client.chat_postMessage(
+                            channel=SLACK_ACCOUNT_CHANNEL_ID,
+                            text="<@U061DQFDYEM> 마지막 메세지 업로드가 48시간 지났습니다. 업로드 부탁드려요~"
+                        )
+                        print("HJ 48시간 경고 메시지 전송 완료")
+                    except Exception as e:
+                        raise e
+                else:
+                    print(f"HJ는 아직 48시간이 지나지 않음 (남은 시간: {datetime.timedelta(hours=48) - time_diff})")
+                        
+        finally:
+            await db_session.close()
+
+    try:
+        await check_async()
+    except Exception as e:
+        await _app.client.chat_postMessage(
+            channel=SLACK_ERROR_LOG_CHANNEL_ID,
+            text=traceback.format_exc()
+        )
