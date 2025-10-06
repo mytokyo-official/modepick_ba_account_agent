@@ -120,80 +120,7 @@ async def update_all_records():
 
         # 모든 변경사항 커밋
         await db_session.commit()
-        print(f"총 {len(rows)}개의 레코드를 업데이트했습니다.")
         
-    finally:
-        await db_session.close()
-
-
-async def check_missing_messages():
-    """SJ_와 HJ_ 메시지 비교하여 누락된 메시지 찾기"""
-    db_session = await get_database_session()
-    try:
-        # 2025-09-01 00:00:00 (KST 기준으로 저장된 시간)
-        filter_date = datetime.datetime(2025, 9, 1, 0, 0, 0)
-        
-        # SJ_로 시작하는 레코드 조회
-        sj_stmt = select(장부_결제문자).filter(
-            장부_결제문자.mac_message_id.like('SJ_%'),
-            장부_결제문자.결제시간 >= filter_date,
-            장부_결제문자.발신번호 == '+8215776200'
-        )
-        sj_result = await db_session.execute(sj_stmt)
-        sj_rows = sj_result.scalars().all()
-        
-        # HJ_로 시작하는 레코드 조회
-        hj_stmt = select(장부_결제문자).filter(
-            장부_결제문자.mac_message_id.like('HJ_%'),
-            장부_결제문자.결제시간 >= filter_date,
-            장부_결제문자.발신번호 == '+8215776200'
-        )
-        hj_result = await db_session.execute(hj_stmt)
-        hj_rows = hj_result.scalars().all()
-        
-        # SJ_ 레코드에서 '고*지'가 포함된 메시지들 필터링
-        sj_goji_rows = [row for row in sj_rows if '고*지' in row.message]
-        
-        # HJ_ 레코드에서 '고*지'가 포함된 메시지들 필터링
-        hj_goji_rows = [row for row in hj_rows if '고*지' in row.message]
-        
-        # 양방향 비교를 위한 메시지 set 생성 (앞 47자)
-        sj_messages = {row.message[:47] for row in sj_goji_rows}
-        hj_messages = {row.message[:47] for row in hj_goji_rows}
-        
-        # SJ_에는 있지만 HJ_에 없는 메시지들 찾기 (앞 47자 비교)
-        sj_missing_in_hj = []
-        for sj_row in sj_goji_rows:
-            if sj_row.message[:47] not in hj_messages:
-                sj_missing_in_hj.append(sj_row)
-        
-        # HJ_에는 있지만 SJ_에 없는 메시지들 찾기 (앞 47자 비교)
-        hj_missing_in_sj = []
-        for hj_row in hj_goji_rows:
-            if hj_row.message[:47] not in sj_messages:
-                hj_missing_in_sj.append(hj_row)
-        
-        print(f"SJ_ 레코드 총 개수: {len(sj_rows)}")
-        print(f"HJ_ 레코드 총 개수: {len(hj_rows)}")
-        print(f"SJ_에서 '고*지' 포함 메시지 개수: {len(sj_goji_rows)}")
-        print(f"HJ_에서 '고*지' 포함 메시지 개수: {len(hj_goji_rows)}")
-        print(f"SJ_에만 있는 메시지 개수: {len(sj_missing_in_hj)}")
-        print(f"HJ_에만 있는 메시지 개수: {len(hj_missing_in_sj)}")
-        
-        print("\n=== SJ_에만 있는 메시지들 ===")
-        for missing_row in sj_missing_in_hj:
-            print(f"ID: {missing_row.mac_message_id}")
-            print(f"메시지: {missing_row.message}")
-            print(f"결제시간: {missing_row.결제시간}")
-            print("-" * 50)
-            
-        print("\n=== HJ_에만 있는 메시지들 ===")
-        for missing_row in hj_missing_in_sj:
-            print(f"ID: {missing_row.mac_message_id}")
-            print(f"메시지: {missing_row.message}")
-            print(f"결제시간: {missing_row.결제시간}")
-            print("-" * 50)
-            
     finally:
         await db_session.close()
 
@@ -220,12 +147,6 @@ async def remove_duplicate_message():
         
         # 모든 변경사항 커밋
         await db_session.commit()
-        print(f"총 {updated_count}개의 SJ_ '고*지' 레코드의 transaction_type을 'N'으로 업데이트했습니다.")
-        
-        # 업데이트된 레코드들 출력
-        for row in rows:
-            print(f"메시지: {row.message}")
-            
     finally:
         await db_session.close()
 
@@ -632,7 +553,6 @@ scheduler.add_job(
 # 모든 이벤트 로깅
 @app.event("message")
 async def handle_message(event, say, client):
-    print(f"=== 메시지 이벤트 수신 ===")
     if event.get("bot_id"):
         return
 
@@ -685,6 +605,10 @@ async def handle_message(event, say, client):
 
 
                 id_match = re.search(r'아이디:\s*([^\s]+)', original_message_text)
+                extracted_id = None
+                if id_match:
+                    extracted_id = id_match.group(1)
+                    print(f"추출된 ID: {extracted_id}")
 
                 content = types.Content(role='user', parts=[types.Part(text=preprocessed_message)])
                 final_response_text = None
@@ -701,10 +625,7 @@ async def handle_message(event, say, client):
                     print(account_classification_output)
                     print("-" * 50)
 
-                    if id_match:
-                        extracted_id = id_match.group(1)
-                        print(f"추출된 ID: {extracted_id}")
-                        
+                    if extracted_id:
                         # 해당 ID로 데이터베이스에서 레코드 찾기
                         db_session = await get_database_session()
                         try:
