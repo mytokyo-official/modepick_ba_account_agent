@@ -21,8 +21,7 @@ class AccountClassificationOutput(BaseModel):
         """)
 
     main_category: Literal[
-        "세금", "운영비", "출장비", "상품비", "생활비",
-        "기타", "인건비", "광고비", "확인필요"
+        "세금", "운영비", "출장비", "상품비", "생활비", "인건비", "광고비", "확인필요"
     ] = Field(description="거래의 대분류")
 
     sub_category: str = Field()
