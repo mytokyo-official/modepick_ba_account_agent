@@ -196,7 +196,12 @@ async def infer_account(_app):
                     account_classification_output = AccountClassificationOutput.model_validate_json(final_response_text)
                     
                     # Slack으로 결과 전송 (데스크톱 최적화 - 컴팩트)
-                    date_str = local_row.결제시간.strftime("%m/%d %H:%M") if local_row.결제시간 else "미확인"
+                    if local_row.결제시간:
+                        # UTC에서 KST로 변환 (+9시간)
+                        kst_time = local_row.결제시간 + datetime.timedelta(hours=9)
+                        date_str = kst_time.strftime("%m/%d %H:%M")
+                    else:
+                        date_str = "미확인"
                     slack_message = f"""{date_str} | {local_row.발신자명} | {local_row.거래상대} | {local_row.amount:,}{local_row.currency} → `{account_classification_output.business_purpose}` > `{account_classification_output.main_category}` > `{account_classification_output.sub_category}` | 아이디: {local_row.mac_message_id}"""
 
                     try:
