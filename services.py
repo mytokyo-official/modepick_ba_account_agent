@@ -10,9 +10,9 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from database import get_database_session
-from models import 장부_결제문자
+from models import 장부_결제문자, Receipt
 from config import CARD_SENDER_LIST, BANK_SENDER_LIST, APP_NAME, USER_ID, SLACK_ERROR_LOG_CHANNEL_ID, \
-    SLACK_ACCOUNT_CHANNEL_ID
+    SLACK_ACCOUNT_CHANNEL_ID, SLACK_REACT_APP_CHANNEL_ID
 from agents.account_classifier import account_classifier, AccountClassificationOutput
 from agents.message_divider_agent import card_message_divider_agent, DividedMessageOutput, bank_message_divider_agent
 
@@ -432,6 +432,121 @@ async def update_cancel_transactions():
         
         await db_session.commit()
         print(f"총 {updated_count}개의 거래가 '취소건'으로 업데이트되었습니다.")
+        
+    finally:
+        await db_session.close()
+
+async def link_receipt_to_payments():
+    """거래목적이 '판매용상품'인 결제문자와 Receipt를 매칭하여 연결"""
+    db_session = await get_database_session()
+    try:
+        filter_date = datetime.datetime(2025, 10, 1, 0, 0, 0)
+
+        # 거래목적이 '판매용상품'인 결제문자들 조회 (아직 Receipt와 연결되지 않은 것들)
+        payment_stmt = select(장부_결제문자).filter(
+            장부_결제문자.거래목적 == '판매용상품',
+            장부_결제문자.idtbl_receipt.is_(None),
+            장부_결제문자.결제시간 >= filter_date
+        ).order_by(장부_결제문자.결제시간)
+        payment_result = await db_session.execute(payment_stmt)
+        payment_rows = payment_result.scalars().all()
+        
+        # 모든 Receipt 조회
+        receipt_stmt = select(Receipt)
+        receipt_result = await db_session.execute(receipt_stmt)
+        receipt_rows = receipt_result.scalars().all()
+        
+        linked_count = 0
+        
+        for payment_row in payment_rows:
+            # amount와 currency가 매칭되는 Receipt들 찾기
+            matching_receipts = []
+            
+            for receipt in receipt_rows:
+                # currency 매칭 확인 (0: JPY, 1: KRW)
+                payment_currency = payment_row.currency
+                receipt_currency_code = "JPY" if receipt.receipt_currency == 0 else "KRW"
+                receipt_amount = (receipt.cash_receipt_price or 0) + (receipt.receipt_price or 0)
+
+                if (payment_currency == receipt_currency_code and 
+                    payment_row.amount == receipt_amount):
+                    
+                    # 날짜 차이 확인 (30일 이내)
+                    if payment_row.결제시간 and receipt.buying_date:
+                        # 결제시간은 datetime, buying_date는 date이므로 date로 변환하여 비교
+                        payment_date = payment_row.결제시간.date()
+                        date_diff = abs((payment_date - receipt.buying_date).days)
+                        
+                        if date_diff <= 30:
+                            matching_receipts.append((receipt, date_diff))
+            
+            # 날짜 차이가 가장 작은 Receipt와 매칭
+            if matching_receipts:
+                # 날짜 차이 순으로 정렬하여 가장 가까운 것 선택
+                matching_receipts.sort(key=lambda x: x[1])
+                best_receipt = matching_receipts[0][0]
+                date_diff = matching_receipts[0][1]
+                
+                # 연결 설정
+                payment_row.idtbl_receipt = best_receipt.idtbl_receipt
+                linked_count += 1
+                
+                print(f"Receipt 연결: {payment_row.mac_message_id} -> Receipt {best_receipt.idtbl_receipt} "
+                      f"(금액: {payment_row.amount} {payment_row.currency}, 날짜차이: {date_diff}일)")
+        
+        await db_session.commit()
+        print(f"총 {linked_count}개의 결제문자가 Receipt와 연결되었습니다.")
+        
+    finally:
+        await db_session.close()
+
+async def send_unlinked_receipts_to_slack(_app):
+    """Receipt와 연결되지 않은 판매용상품 거래를 슬랙으로 전송"""
+    db_session = await get_database_session()
+    try:
+        # KST 2025-10-01 00:00:00
+        kst_filter_date = datetime.datetime(2025, 10, 1, 0, 0, 0)
+        # KST에서 UTC로 변환 (KST = UTC + 9시간이므로 UTC = KST - 9시간)
+        filter_date = kst_filter_date - datetime.timedelta(hours=9)
+        
+        # 조건에 맞는 레코드들 조회
+        stmt = select(장부_결제문자).filter(
+            장부_결제문자.idtbl_receipt.is_(None),
+            장부_결제문자.거래목적 == '판매용상품',
+            장부_결제문자.결제시간 >= filter_date
+        ).order_by(장부_결제문자.결제시간)
+        
+        result = await db_session.execute(stmt)
+        rows = result.scalars().all()
+        
+        if not rows:
+            print("조건에 맞는 미연결 거래가 없습니다.")
+            return
+        
+        # 각 거래를 개별 메시지로 전송
+        sent_count = 0
+        for row in rows:
+            # KST 기준으로 날짜 포맷팅 (MM/dd HH:mm)
+            if row.결제시간:
+                # UTC에서 KST로 변환 (+9시간)
+                kst_time = row.결제시간 + datetime.timedelta(hours=9)
+                date_str = kst_time.strftime("%m/%d %H:%M")
+            else:
+                date_str = "미확인"
+            amount_str = f"{row.amount:,}{row.currency} |아이디: {row.mac_message_id}" if row.amount else "미확인"
+            
+            message = f"영수증 없음:pleading_face: {date_str} | {row.발신자명 or '미확인'} | {row.거래상대 or '미확인'} | {amount_str}"
+            
+            try:
+                await _app.client.chat_postMessage(
+                    channel=SLACK_REACT_APP_CHANNEL_ID,
+                    text=message
+                )
+                sent_count += 1
+            except Exception as e:
+                print(f"Slack 메시지 전송 실패: {e}")
+        
+        print(f"미연결 거래 {sent_count}/{len(rows)}건을 슬랙으로 전송했습니다.")
         
     finally:
         await db_session.close()

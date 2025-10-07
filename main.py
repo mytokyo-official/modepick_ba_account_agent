@@ -12,7 +12,7 @@ from services import (
     remove_duplicate_message,
     message_divider_run,
     infer_account,
-    check_last_message_upload, update_cancel_transactions
+    check_last_message_upload, update_cancel_transactions, link_receipt_to_payments, send_unlinked_receipts_to_slack
 )
 from handlers import handle_message
 
@@ -34,15 +34,19 @@ async def run_agent_routine():
     await message_divider_run()
     await update_cancel_transactions()
     await infer_account(app)
+    await link_receipt_to_payments()
 
-async def check_last_message_upload_wrapper():
+async def check_once_per_day():
     try:
         await check_last_message_upload(app)
+        await send_unlinked_receipts_to_slack(app)
     except Exception as e:
         await app.client.chat_postMessage(
             channel=SLACK_ERROR_LOG_CHANNEL_ID,
             text=traceback.format_exc()
         )
+
+
 
 # 스케줄러 설정
 scheduler = AsyncIOScheduler()
@@ -53,7 +57,7 @@ scheduler.add_job(
 )
 
 scheduler.add_job(
-    check_last_message_upload_wrapper,
+    check_once_per_day,
     'cron',
     hour=14,
     minute=0

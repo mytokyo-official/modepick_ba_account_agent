@@ -1,6 +1,18 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, Float, MetaData
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.sql import func
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Boolean,
+    DateTime,
+    BigInteger,
+    ForeignKey,
+    Date,
 
+)
 # Database setup
 metadata = MetaData(schema="modepick_management_prod")
 Base = declarative_base(metadata=metadata)
@@ -24,3 +36,30 @@ class 장부_결제문자(Base):
 
     account_reason = Column(Text)
     confidence = Column(Float)
+    idtbl_receipt = Column(BigInteger, ForeignKey("tbl_receipt.idtbl_receipt"))
+
+
+
+
+class Receipt(Base):
+    __tablename__ = "tbl_receipt"
+
+    idtbl_receipt = Column(BigInteger, primary_key=True)
+    taxfree = Column(Boolean, default=None)
+    taxfree_return_cash = Column(Integer, default=None)
+    pay_personal_card = Column(Boolean, default=None)
+    receipt_image_path = Column(MEDIUMTEXT, nullable=False)
+    receipt_currency = Column(Integer)  # 0은 엔화, 1은 원화
+    receipt_price = Column(Integer)
+    cash_receipt_price = Column(Integer)
+
+    memo = Column(String(200), default=None)
+    need_return_currency = Column(Integer)
+    need_return_price = Column(Integer)
+    need_return_image_path = Column(String(100), default=None)
+    forwarder_receipt_image_path = Column(String(100), default=None)
+    user_id = Column(Integer, ForeignKey("tbl_users.idtbl_users"))
+    manager_confirmed = Column(Boolean, default=False)
+    buying_date = Column(Date, default=None)
+    created_time = Column(DateTime, default=func.current_timestamp())
+    update_time = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
