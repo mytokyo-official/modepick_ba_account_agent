@@ -6,6 +6,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from langsmith.integrations.otel import configure
 
+import config
 from config import SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_ERROR_LOG_CHANNEL_ID
 from services import (
     update_all_records,

@@ -12,7 +12,7 @@ from google.genai import types
 from database import get_database_session
 from models import 장부_결제문자, Receipt
 from config import CARD_SENDER_LIST, BANK_SENDER_LIST, APP_NAME, USER_ID, SLACK_ERROR_LOG_CHANNEL_ID, \
-    SLACK_ACCOUNT_CHANNEL_ID, SLACK_REACT_APP_CHANNEL_ID
+    SLACK_ACCOUNT_CHANNEL_ID, SLACK_REACT_APP_CHANNEL_ID, MAX_CONCURRENT_SESSIONS
 from agents.account_classifier import account_classifier, AccountClassificationOutput
 from agents.message_divider_agent import card_message_divider_agent, DividedMessageOutput, bank_message_divider_agent
 
@@ -115,7 +115,7 @@ async def infer_account(_app):
         session_count = 0
 
         async def process_single_row(row, session_id_suffix):
-            """단일 row 처리 함수"""
+            """단일 row 처리 함수 - 슬랙 전송 없이 DB 업데이트만"""
             # 각 작업마다 독립적인 데이터베이스 세션 생성
             local_db_session = await get_database_session()
             
@@ -195,23 +195,7 @@ async def infer_account(_app):
                 if final_response_text:
                     account_classification_output = AccountClassificationOutput.model_validate_json(final_response_text)
                     
-                    # Slack으로 결과 전송 (데스크톱 최적화 - 컴팩트)
-                    if local_row.결제시간:
-                        # UTC에서 KST로 변환 (+9시간)
-                        kst_time = local_row.결제시간 + datetime.timedelta(hours=9)
-                        date_str = kst_time.strftime("%m/%d %H:%M")
-                    else:
-                        date_str = "미확인"
-                    slack_message = f"""{date_str} | {local_row.발신자명} | {local_row.거래상대} | {local_row.amount:,}{local_row.currency} → `{account_classification_output.business_purpose}` > `{account_classification_output.main_category}` > `{account_classification_output.sub_category}` | 아이디: {local_row.mac_message_id}"""
-
-                    try:
-                        await _app.client.chat_postMessage(
-                            channel=SLACK_ACCOUNT_CHANNEL_ID,
-                            text=slack_message
-                        )
-                    except Exception as e:
-                        print(f"Slack 메시지 전송 실패: {e}")
-                    
+                    # DB 업데이트만 수행 (슬랙 전송은 별도 처리)
                     local_row.거래목적 = account_classification_output.business_purpose
                     local_row.계정과목_대 = account_classification_output.main_category
                     local_row.계정과목_소 = account_classification_output.sub_category
@@ -231,6 +215,7 @@ async def infer_account(_app):
         # 10개 단위로 배치 처리
         batch_size = 5
         total_processed = 0
+        processed_results = []  # 처리된 결과들을 저장할 리스트
         
         for i in range(0, len(target_rows), batch_size):
             batch = target_rows[i:i + batch_size]
@@ -243,14 +228,54 @@ async def infer_account(_app):
                 tasks.append(process_single_row(row, session_id))
             
             # 배치 단위로 병렬 실행
-            await asyncio.gather(*tasks)
+            batch_results = await asyncio.gather(*tasks)
+            
+            # 성공적으로 처리된 결과만 수집
+            for result in batch_results:
+                if result and result.거래목적:  # 처리가 성공하고 거래목적이 설정된 경우만
+                    processed_results.append(result)
             
             total_processed += len(batch)
             print(f"배치 완료. 총 {total_processed}개 처리됨")
 
+        # 모든 처리 완료 후, 처리된 결과만 시간순으로 슬랙 전송
+        if processed_results:
+            print(f"처리 완료. {len(processed_results)}개 결과를 시간순으로 슬랙 전송 시작...")
+            await send_processed_results_to_slack(_app, processed_results)
+        else:
+            print("처리된 결과가 없습니다.")
             
     finally:
         await db_session.close()
+
+async def send_processed_results_to_slack(_app, processed_results):
+    """처리된 결과를 시간순으로 슬랙에 전송"""
+    # 처리된 결과들을 결제시간 순으로 정렬
+    sorted_results = sorted(processed_results, key=lambda x: x.결제시간 or datetime.datetime.min)
+    
+    sent_count = 0
+    for row in sorted_results:
+        # KST 기준으로 날짜 포맷팅
+        if row.결제시간:
+            kst_time = row.결제시간 + datetime.timedelta(hours=9)
+            date_str = kst_time.strftime("%m/%d %H:%M")
+        else:
+            date_str = "미확인"
+            
+        slack_message = f"""{date_str} | {row.발신자명} | {row.거래상대} | {row.amount:,}{row.currency} → `{row.거래목적}` > `{row.계정과목_대}` > `{row.계정과목_소}` | 아이디: {row.mac_message_id}"""
+        
+        try:
+            await _app.client.chat_postMessage(
+                channel=SLACK_ACCOUNT_CHANNEL_ID,
+                text=slack_message
+            )
+            sent_count += 1
+            # 슬랙 API 부하 방지를 위한 짧은 딜레이
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            print(f"Slack 메시지 전송 실패: {e}")
+    
+    print(f"시간순으로 {sent_count}개의 처리 결과를 슬랙으로 전송했습니다.")
 
 async def message_divider_run():
     db_session = await get_database_session()
@@ -261,58 +286,110 @@ async def message_divider_run():
         stmt = select(장부_결제문자).filter(
             장부_결제문자.transaction_type.is_(None),
             장부_결제문자.결제시간 >= filter_date
-        )
+        ).order_by(장부_결제문자.결제시간.asc())
 
         result = await db_session.execute(stmt)
         rows = result.scalars().all()
 
-        session_count = 0
+        async def process_single_message(row, session_id_suffix):
+            """단일 메시지 처리 함수 - 독립적인 DB 세션 사용"""
+            local_db_session = await get_database_session()
 
-        for row in rows:
-            SESSION_ID = f"session_{session_count}"
-            adk_session_service = InMemorySessionService()
-            adk_session = await adk_session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID)
-
-            if row.발신번호 in CARD_SENDER_LIST:
-                runner = Runner(
-                    agent=card_message_divider_agent,
-                    app_name=APP_NAME,
-                    session_service=adk_session_service
+            try:
+                # 현재 처리할 row를 새 세션에서 다시 조회
+                local_row_stmt = select(장부_결제문자).filter(
+                    장부_결제문자.mac_message_id == row.mac_message_id
                 )
-            elif row.발신번호 in BANK_SENDER_LIST:
-                runner = Runner(
-                    agent=bank_message_divider_agent,
+                local_row_result = await local_db_session.execute(local_row_stmt)
+                local_row = local_row_result.scalars().first()
+
+                if not local_row:
+                    return None
+
+                SESSION_ID = f"session_{session_id_suffix}"
+                adk_session_service = InMemorySessionService()
+                adk_session = await adk_session_service.create_session(
                     app_name=APP_NAME,
-                    session_service=adk_session_service
+                    user_id=USER_ID,
+                    session_id=SESSION_ID
                 )
-            else:
-                print(row.message, row.발신번호, "runner 생성 실패.")
-                continue
 
-            preprocessed_message = await preprocess_message(row.message)
+                if local_row.발신번호 in CARD_SENDER_LIST:
+                    runner = Runner(
+                        agent=card_message_divider_agent,
+                        app_name=APP_NAME,
+                        session_service=adk_session_service
+                    )
+                elif local_row.발신번호 in BANK_SENDER_LIST:
+                    runner = Runner(
+                        agent=bank_message_divider_agent,
+                        app_name=APP_NAME,
+                        session_service=adk_session_service
+                    )
+                else:
+                    print(local_row.message, local_row.발신번호, "runner 생성 실패.")
+                    return None
 
-            content = types.Content(role='user', parts=[types.Part(text=preprocessed_message)])
-            final_response_text = None
-            async for event in runner.run_async(user_id=USER_ID, session_id=SESSION_ID,
-                                                new_message=content):
-                if event.is_final_response():
-                    if event.content and event.content.parts:
-                        final_response_text = event.content.parts[0].text
-                    elif event.actions and event.actions.escalate:  # Handle potential errors/escalations
-                        final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
+                preprocessed_message = await preprocess_message(local_row.message)
 
-            if final_response_text:
-                divided_message = DividedMessageOutput.model_validate_json(final_response_text)
-                print(preprocessed_message)
-                print(divided_message)
-                print("-" * 50)
-                row.transaction_type = divided_message.transaction_type
-                row.amount = divided_message.amount
-                row.currency = divided_message.currency
-                row.거래상대 = divided_message.transaction_party
-                await db_session.commit()
+                content = types.Content(role='user', parts=[types.Part(text=preprocessed_message)])
+                final_response_text = None
+                async for event in runner.run_async(user_id=USER_ID, session_id=SESSION_ID,
+                                                    new_message=content):
+                    if event.is_final_response():
+                        if event.content and event.content.parts:
+                            final_response_text = event.content.parts[0].text
+                        elif event.actions and event.actions.escalate:
+                            final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
 
-            session_count += 1
+                if final_response_text:
+                    divided_message = DividedMessageOutput.model_validate_json(final_response_text)
+                    print(preprocessed_message)
+                    print(divided_message)
+                    print("-" * 50)
+                    local_row.transaction_type = divided_message.transaction_type
+                    local_row.amount = divided_message.amount
+                    local_row.currency = divided_message.currency
+                    local_row.거래상대 = divided_message.transaction_party
+                    await local_db_session.commit()
+                    return local_row
+
+                return None
+
+            except Exception as e:
+                print(f"메시지 처리 에러 (ID: {row.mac_message_id}): {e}")
+                await local_db_session.rollback()
+                return None
+            finally:
+                await local_db_session.close()
+
+        # 배치 처리
+        batch_size = MAX_CONCURRENT_SESSIONS
+        total_processed = 0
+        processed_count = 0
+
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            print(f"\n배치 {i//batch_size + 1} 처리 중... ({len(batch)}개 메시지)")
+
+            # 배치 내 작업들을 병렬로 실행
+            tasks = []
+            for j, row in enumerate(batch):
+                session_id = f"{total_processed + j}"
+                tasks.append(process_single_message(row, session_id))
+
+            # 배치 단위로 병렬 실행
+            batch_results = await asyncio.gather(*tasks)
+
+            # 성공적으로 처리된 결과만 카운트
+            for result in batch_results:
+                if result:
+                    processed_count += 1
+
+            total_processed += len(batch)
+            print(f"배치 완료. 총 {total_processed}개 처리됨 (성공: {processed_count}개)")
+
+        print(f"\n처리 완료: 총 {processed_count}/{len(rows)}개 메시지 처리 성공")
 
     finally:
         await db_session.close()
@@ -421,7 +498,7 @@ async def update_cancel_transactions():
             ]
 
             if not matching_approvals:
-                print("찾을수 없음.", refund_row.message)
+                print("승인취소를 매칭 시킬 수 없음.", refund_row.message)
             
             # 거래상대 유사도가 0.8 이상인 것 찾기
             for approval in matching_approvals:
@@ -510,7 +587,7 @@ async def send_unlinked_receipts_to_slack(_app):
     db_session = await get_database_session()
     try:
         # KST 2025-10-01 00:00:00
-        kst_filter_date = datetime.datetime(2025, 10, 1, 0, 0, 0)
+        kst_filter_date = datetime.datetime(2025, 10, 14, 0, 0, 0)
         # KST에서 UTC로 변환 (KST = UTC + 9시간이므로 UTC = KST - 9시간)
         filter_date = kst_filter_date - datetime.timedelta(hours=9)
         

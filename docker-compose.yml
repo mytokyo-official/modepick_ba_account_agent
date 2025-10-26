@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: modepick-ba-account-agent:latest
+    container_name: modepick-ba-account-agent
+    restart: unless-stopped
+
+    # 환경변수 설정 (.env 파일 사용)
+    env_file:
+      - .env

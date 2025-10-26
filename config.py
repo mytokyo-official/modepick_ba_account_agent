@@ -13,9 +13,13 @@ SLACK_ACCOUNT_CHANNEL_ID = os.getenv('SLACK_ACCOUNT_CHANNEL_ID')
 SLACK_ERROR_LOG_CHANNEL_ID = os.getenv('SLACK_ERROR_LOG_CHANNEL_ID')
 SLACK_REACT_APP_CHANNEL_ID = os.getenv('SLACK_REACT_APP_CHANNEL_ID')
 
+APP_ENV = os.getenv('APP_ENV')
 # Application configuration
 APP_NAME = "account_app"
 USER_ID = "modepick"
+
+# Concurrency configuration
+MAX_CONCURRENT_SESSIONS = 3  # Number of parallel sessions for message processing
 
 # Sender lists
 CARD_SENDER_LIST = {
